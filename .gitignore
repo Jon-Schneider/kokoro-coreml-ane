@@ -17,3 +17,9 @@ build/
 
 # iOSDemo
 iOSDemo/iOSDemo/Models/*.mlpackage
+
+# SPM
+.build/
+
+# Local HF cache for conversion runs
+.hf-cache/
