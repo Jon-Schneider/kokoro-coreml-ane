@@ -171,10 +171,17 @@ public final class KokoroEngine {
     /// needs ≥ 5 (conv_post ±3 plus the deconv's 4-position overlap); 16 leaves margin.
     private static let tailWindowHalo = 16
 
-    /// The converted tail declares a 100-position lower bound on `x_pre`, so a window is never narrower
-    /// than this — a short final window is widened backward into already-emitted territory instead (the
-    /// extra positions are halo and produce no samples).
-    private static let tailWindowMinimumWidth = 128
+    /// Every tail invocation's `x_pre` width is rounded up to a multiple of this. Under the
+    /// background-safe policy Core ML places the fp32 tail on the CPU's BNNS graph engine, whose
+    /// vectorized kernels read a whole SIMD block past the final position of an unaligned width — an
+    /// EXC_BAD_ACCESS when the over-read crosses a VM page boundary. Whole-utterance widths are
+    /// `T_a·120 + 1`, always odd, so unwindowed playback on iPhone crashed intermittently (crash in
+    /// `BNNSGraphContextExecute_v2` at a page-aligned address, width 7681). 128 positions is far above
+    /// any SIMD block, keeps per-channel row byte counts page-friendly, and satisfies the converted
+    /// tail's 100-position lower bound on `x_pre`. Rounding prefers widening over real neighboring
+    /// positions, which is numerically exact (the extras are halo); see `tailWindowSamples` for the
+    /// zero-padding fallback when the utterance itself is shorter than the rounded width.
+    private static let tailWidthAlignment = 128
 
     private let albert: MLModel
     private let postAlbert: MLModel
@@ -236,11 +243,8 @@ public final class KokoroEngine {
         var start = 0
         while start < frameCount {
             let end = min(start + step, frameCount)
-            var inputStart = max(0, start - Self.tailWindowHalo)
+            let inputStart = max(0, start - Self.tailWindowHalo)
             let inputEnd = min(frameCount, end + Self.tailWindowHalo)
-            if inputEnd - inputStart < Self.tailWindowMinimumWidth {
-                inputStart = max(0, inputEnd - Self.tailWindowMinimumWidth)
-            }
             let samples = try tailWindowSamples(
                 prePostConvFloats,
                 frameCount: frameCount,
@@ -256,24 +260,36 @@ public final class KokoroEngine {
     /// One tail invocation over `input` positions of `x_pre`, returning only the samples belonging to the
     /// `emitting` positions. `input` must contain `emitting` plus enough halo for exactness (or touch the
     /// true utterance boundary, where the model's own zero-padding is the correct global behavior).
+    ///
+    /// The invocation width is `input.count` rounded up to `tailWidthAlignment` (see that constant for the
+    /// BNNS crash this avoids). The extra positions are taken from real neighbors — backward first, then
+    /// forward — which is exact because they are pure halo. Only when the whole utterance is shorter than
+    /// the rounded width is the window zero-padded past `frameCount`: the zeros match the model's own
+    /// implicit `conv_post` padding, and the junk iSTFT columns they produce reach at most the final
+    /// `tailHop` emitted samples (≈0.2 ms at the utterance's very end).
     private func tailWindowSamples(
         _ prePostConvFloats: [Float],
         frameCount: Int,
         input: Range<Int>,
         emitting: Range<Int>
     ) throws -> [Float] {
-        let width = input.count
+        let width = (input.count + Self.tailWidthAlignment - 1)
+            / Self.tailWidthAlignment * Self.tailWidthAlignment
+        let start = max(0, input.upperBound - width)
+        let realEnd = min(frameCount, start + width)
+        let realWidth = realEnd - start
+
         let windowValues: [Float]
-        if width == frameCount {
+        if width == frameCount, start == 0 {
             windowValues = prePostConvFloats
         } else {
             var sliced = [Float](repeating: 0, count: 128 * width)
             for channel in 0 ..< 128 {
-                let sourceStart = channel * frameCount + input.lowerBound
+                let sourceStart = channel * frameCount + start
                 let destinationStart = channel * width
                 sliced.replaceSubrange(
-                    destinationStart ..< destinationStart + width,
-                    with: prePostConvFloats[sourceStart ..< sourceStart + width]
+                    destinationStart ..< destinationStart + realWidth,
+                    with: prePostConvFloats[sourceStart ..< sourceStart + realWidth]
                 )
             }
             windowValues = sliced
@@ -294,16 +310,16 @@ public final class KokoroEngine {
             )
         }
 
-        // A window's sample for global position g sits at local index `hop·g − hop·input.lowerBound`. The
-        // final positions of the utterance produce `hop` fewer samples (the model crops `n_fft/2` from
-        // each end), hence the clamp.
+        // A window's sample for global position g sits at local index `hop·g − hop·start`. The final
+        // positions of the utterance produce `hop` fewer samples (the model crops `n_fft/2` from each
+        // end), hence the clamp.
         let globalSampleStart = Self.tailHop * emitting.lowerBound
         let globalSampleEnd = min(
             Self.tailHop * emitting.upperBound,
             Self.tailHop * frameCount - Self.tailHop
         )
-        let localStart = globalSampleStart - Self.tailHop * input.lowerBound
-        let localEnd = globalSampleEnd - Self.tailHop * input.lowerBound
+        let localStart = globalSampleStart - Self.tailHop * start
+        let localEnd = globalSampleEnd - Self.tailHop * start
         return Array(samples[localStart ..< localEnd])
     }
 }
