@@ -19,7 +19,9 @@ let phonemes = arguments.count > 4 ? arguments[4] : "ðə kwɪk bɹaʊn fɑːks 
 
 do {
     let loadStart = Date()
-    let engine = try KokoroEngine(modelsDirectory: modelsDirectory, computeUnits: .backgroundSafe)
+    let units: KokoroStageComputeUnits = ProcessInfo.processInfo
+        .environment["KOKORO_UNITS"] == "cpuOnly" ? .cpuOnly : .backgroundSafe
+    let engine = try KokoroEngine(modelsDirectory: modelsDirectory, computeUnits: units)
     let voiceName = voiceURL.deletingPathExtension().lastPathComponent
     let voice = try KokoroVoicePack(name: voiceName, contentsOf: voiceURL)
     print("load: \(String(format: "%.0f", -loadStart.timeIntervalSinceNow * 1000))ms")
