@@ -149,14 +149,32 @@ public final class KokoroEngine {
             )
         }
         let frameCount = prePostConvFloats.count / 128
-        let tailOutputs = try tail.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "x_pre": try MLMultiArrayConversions.floatArray(prePostConvFloats, shape: [1, 128, frameCount]),
-        ]))
-        let audio = try output(tailOutputs, stage: "tail", feature: "audio")
-        return MLMultiArrayConversions.floats(from: audio)
+        return try tailAudio(prePostConvFloats: prePostConvFloats, frameCount: frameCount)
     }
 
     // MARK: Private
+
+    /// The tail's iSTFT hop: every `x_pre` position becomes 5 audio samples (deconv kernel 20, stride 5,
+    /// `n_fft/2 = 10` cropped from each end), so a `T`-position input yields exactly `5·T − 5` samples.
+    private static let tailHop = 5
+
+    /// Maximum `x_pre` positions per tail invocation. Upstream only ever ran the tail on whole utterances
+    /// with `.all` compute units (GPU); under the background-safe CPU+ANE policy on iPhone, large inputs
+    /// crash inside the Core ML runtime (EXC_BAD_ACCESS) — ~9.6k positions are proven fine on device while
+    /// ~96k crash, and the ANE's 16384 dimension ceiling sits between. Windowing bounds every call to the
+    /// proven scale; it is numerically exact because the tail is local (conv_post reads ±3 positions, the
+    /// iSTFT deconv spans 20 positions at stride 5 — both far smaller than `tailWindowHalo`).
+    private static let tailWindowLength = 9600
+
+    /// Positions of context included on each interior window edge. Samples within the halo are discarded,
+    /// so each emitted sample sees exactly the neighborhood it would in a whole-utterance call. The math
+    /// needs ≥ 5 (conv_post ±3 plus the deconv's 4-position overlap); 16 leaves margin.
+    private static let tailWindowHalo = 16
+
+    /// The converted tail declares a 100-position lower bound on `x_pre`, so a window is never narrower
+    /// than this — a short final window is widened backward into already-emitted territory instead (the
+    /// extra positions are halo and produce no samples).
+    private static let tailWindowMinimumWidth = 128
 
     private let albert: MLModel
     private let postAlbert: MLModel
@@ -197,5 +215,95 @@ public final class KokoroEngine {
             throw KokoroANEError.missingOutput(stage: stage, feature: feature)
         }
         return value
+    }
+
+    /// Runs the tail over `x_pre` (packed `[1, 128, frameCount]`), windowing the position axis so no
+    /// single Core ML invocation exceeds `tailWindowLength` positions. Output samples are concatenated
+    /// from each window's central span, which the halo makes identical to a whole-utterance call.
+    private func tailAudio(prePostConvFloats: [Float], frameCount: Int) throws -> [Float] {
+        if frameCount <= Self.tailWindowLength {
+            return try tailWindowSamples(
+                prePostConvFloats,
+                frameCount: frameCount,
+                input: 0 ..< frameCount,
+                emitting: 0 ..< frameCount
+            )
+        }
+
+        var audio = [Float]()
+        audio.reserveCapacity(Self.tailHop * frameCount - Self.tailHop)
+        let step = Self.tailWindowLength - 2 * Self.tailWindowHalo
+        var start = 0
+        while start < frameCount {
+            let end = min(start + step, frameCount)
+            var inputStart = max(0, start - Self.tailWindowHalo)
+            let inputEnd = min(frameCount, end + Self.tailWindowHalo)
+            if inputEnd - inputStart < Self.tailWindowMinimumWidth {
+                inputStart = max(0, inputEnd - Self.tailWindowMinimumWidth)
+            }
+            let samples = try tailWindowSamples(
+                prePostConvFloats,
+                frameCount: frameCount,
+                input: inputStart ..< inputEnd,
+                emitting: start ..< end
+            )
+            audio.append(contentsOf: samples)
+            start = end
+        }
+        return audio
+    }
+
+    /// One tail invocation over `input` positions of `x_pre`, returning only the samples belonging to the
+    /// `emitting` positions. `input` must contain `emitting` plus enough halo for exactness (or touch the
+    /// true utterance boundary, where the model's own zero-padding is the correct global behavior).
+    private func tailWindowSamples(
+        _ prePostConvFloats: [Float],
+        frameCount: Int,
+        input: Range<Int>,
+        emitting: Range<Int>
+    ) throws -> [Float] {
+        let width = input.count
+        let windowValues: [Float]
+        if width == frameCount {
+            windowValues = prePostConvFloats
+        } else {
+            var sliced = [Float](repeating: 0, count: 128 * width)
+            for channel in 0 ..< 128 {
+                let sourceStart = channel * frameCount + input.lowerBound
+                let destinationStart = channel * width
+                sliced.replaceSubrange(
+                    destinationStart ..< destinationStart + width,
+                    with: prePostConvFloats[sourceStart ..< sourceStart + width]
+                )
+            }
+            windowValues = sliced
+        }
+
+        let tailOutputs = try tail.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "x_pre": try MLMultiArrayConversions.floatArray(windowValues, shape: [1, 128, width]),
+        ]))
+        let audio = try output(tailOutputs, stage: "tail", feature: "audio")
+        let samples = MLMultiArrayConversions.floats(from: audio)
+        let expectedCount = Self.tailHop * width - Self.tailHop
+        guard samples.count == expectedCount else {
+            throw KokoroANEError.unexpectedStageOutput(
+                stage: "tail",
+                feature: "audio",
+                descriptor: MLMultiArrayConversions.describe(audio)
+                    + " (expected \(expectedCount) samples for \(width) x_pre positions)"
+            )
+        }
+
+        // A window's sample for global position g sits at local index `hop·g − hop·input.lowerBound`. The
+        // final positions of the utterance produce `hop` fewer samples (the model crops `n_fft/2` from
+        // each end), hence the clamp.
+        let globalSampleStart = Self.tailHop * emitting.lowerBound
+        let globalSampleEnd = min(
+            Self.tailHop * emitting.upperBound,
+            Self.tailHop * frameCount - Self.tailHop
+        )
+        let localStart = globalSampleStart - Self.tailHop * input.lowerBound
+        let localEnd = globalSampleEnd - Self.tailHop * input.lowerBound
+        return Array(samples[localStart ..< localEnd])
     }
 }

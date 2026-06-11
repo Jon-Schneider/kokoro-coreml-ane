@@ -11,6 +11,7 @@ let package = Package(
     products: [
         .library(name: "KokoroANE", targets: ["KokoroANE"]),
         .executable(name: "kokoro-validate", targets: ["KokoroValidate"]),
+        .executable(name: "kokoro-soak", targets: ["KokoroSoak"]),
     ],
     targets: [
         .target(
@@ -24,6 +25,11 @@ let package = Package(
             name: "KokoroValidate",
             dependencies: ["KokoroANE"],
             path: "Sources/KokoroValidate"
+        ),
+        .executableTarget(
+            name: "KokoroSoak",
+            dependencies: ["KokoroANE"],
+            path: "Sources/KokoroSoak"
         ),
     ]
 )
