@@ -136,9 +136,19 @@ public final class KokoroEngine {
         ]))
         let prePostConv = try output(vocoderOutputs, stage: "vocoder", feature: "x_pre")
 
-        // 7. Tail (fp32): conv_post + exp/sin + iSTFT → PCM.
+        // 7. Tail (fp32): conv_post + exp/sin + iSTFT → PCM. The vocoder declares no static shape for
+        // `x_pre` and different Core ML backends report different ranks for it (rank 3 on macOS, but
+        // ANE-compiled graphs can add leading singleton dimensions), so the frame count is derived from
+        // the element count — a positional `shape[2]` read mis-sizes the tail input on those backends.
         let prePostConvFloats = MLMultiArrayConversions.floats(from: prePostConv)
-        let frameCount = prePostConv.shape.count >= 3 ? prePostConv.shape[2].intValue : 0
+        guard !prePostConvFloats.isEmpty, prePostConvFloats.count % 128 == 0 else {
+            throw KokoroANEError.unexpectedStageOutput(
+                stage: "vocoder",
+                feature: "x_pre",
+                descriptor: MLMultiArrayConversions.describe(prePostConv)
+            )
+        }
+        let frameCount = prePostConvFloats.count / 128
         let tailOutputs = try tail.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "x_pre": try MLMultiArrayConversions.floatArray(prePostConvFloats, shape: [1, 128, frameCount]),
         ]))
