@@ -428,6 +428,15 @@ class CoreMLForwardSTFT(nn.Module):
         imag_out = self.conv_imag(x)
         magnitude = torch.sqrt(real_out ** 2 + imag_out ** 2 + 1e-14)
         phase = torch.atan2(imag_out, real_out)
+        # Core ML's atan2 lowering returns 0 on the branch cut (imag == 0, real < 0) where PyTorch
+        # returns pi. The DC bin's imaginary conv weights are exactly zero (-sin(0) * window), so its
+        # phase feature must toggle 0/pi with the sign of the windowed mean of the harmonic source;
+        # without this select the converted graph pins it to 0, injecting a voiced-gated, frame-rate
+        # (24000/hop = 4800 Hz) bias into noise_convs that is audible as a constant whistle riding on
+        # speech. torch.where keeps the trace a bit-exact no-op in PyTorch while forcing the converted
+        # graph to match torch semantics.
+        branch_cut = (imag_out == 0) & (real_out < 0)
+        phase = torch.where(branch_cut, torch.full_like(phase, math.pi), phase)
         return magnitude, phase
 
 
