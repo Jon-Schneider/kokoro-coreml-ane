@@ -93,15 +93,7 @@ class CoreMLVocoderDualOutput(nn.Module):
             x = xs / self.num_kernels
         x_pre = F.leaky_relu(x)
         anchor = x_pre.mean().unsqueeze(0)
-        # x_pre is [1, 128, 120*T_a + 1]. As a single output it binds to a 1-D IOSurface whose
-        # bytes-per-row is the full width (~22 MB for a sentence-length chunk), which overflows the ANE's
-        # output-port IOSurface row limit and crashes mid-playback ("Failed to allocate E5 buffer object").
-        # The internal layers tile fine; only the host-facing output buffer is over the limit. Splitting
-        # off the lone cat-prepended column and folding the remaining 120*T_a columns into [T_a, 120]
-        # (an exact reshape — no padding) drops bytes-per-row to 120 elements; the host flattens it back.
-        x_pre_head = x_pre[:, :, :1]
-        x_pre_body = x_pre[:, :, 1:].reshape(1, 128, -1, 120)
-        return anchor, x_pre_head, x_pre_body
+        return anchor, x_pre
 
 
 class CoreMLTailModel(nn.Module):
@@ -786,7 +778,7 @@ def main():
                     ct.TensorType(name="x_source_0", shape=(1, ns0_C, T_ns0), dtype=np.float16),
                     ct.TensorType(name="x_source_1", shape=(1, ns1_C, T_ns1), dtype=np.float16),
                     ct.TensorType(name="style_timbre", shape=(1, 128), dtype=np.float16)],
-            outputs=[ct.TensorType(name="anchor"), ct.TensorType(name="x_pre_head"), ct.TensorType(name="x_pre_body")],
+            outputs=[ct.TensorType(name="anchor"), ct.TensorType(name="x_pre")],
             convert_to="mlprogram", minimum_deployment_target=ct.target.iOS17,
             compute_precision=ct.precision.FLOAT16, compute_units=ct.ComputeUnit.CPU_AND_NE)
         print('    Palettizing...')
