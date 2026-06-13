@@ -125,7 +125,12 @@ public final class KokoroEngine {
         let source1 = try output(noiseOutputs, stage: "noise", feature: "x_source_1")
 
         // 6. Vocoder (fp16, ANE): the bulk of the decoder. The anchor output exists only to keep the
-        // graph ANE-resident; only `x_pre` feeds the tail.
+        // graph ANE-resident; `x_pre` (the post-conv pre-tail tensor) feeds the tail. `x_pre` is
+        // `[1, 128, 120·T_a + 1]`; as one tensor its host-facing output buffer is a single ~22 MB row that
+        // overflows the ANE's IOSurface row limit and crashes mid-playback ("Failed to allocate E5 buffer
+        // object"). The model instead returns it folded — the lone cat-prepended column as `x_pre_head`
+        // `[1, 128, 1]` and the remaining `120·T_a` columns as `x_pre_body` `[1, 128, T_a, 120]` (exact,
+        // no padding) — so each output buffer's bytes-per-row is tiny. Reassemble the flat `x_pre` here.
         let vocoderOutputs = try vocoder.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "asr": alignedText,
             "F0_curve": f0Curve,
@@ -134,20 +139,13 @@ public final class KokoroEngine {
             "x_source_1": source1,
             "style_timbre": try MLMultiArrayConversions.float16Array(styleTimbre, shape: [1, 128]),
         ]))
-        let prePostConv = try output(vocoderOutputs, stage: "vocoder", feature: "x_pre")
+        let prePostConvFloats = try unfoldXPre(
+            head: try output(vocoderOutputs, stage: "vocoder", feature: "x_pre_head"),
+            body: try output(vocoderOutputs, stage: "vocoder", feature: "x_pre_body")
+        )
 
-        // 7. Tail (fp32): conv_post + exp/sin + iSTFT → PCM. The vocoder declares no static shape for
-        // `x_pre` and different Core ML backends report different ranks for it (rank 3 on macOS, but
-        // ANE-compiled graphs can add leading singleton dimensions), so the frame count is derived from
-        // the element count — a positional `shape[2]` read mis-sizes the tail input on those backends.
-        let prePostConvFloats = MLMultiArrayConversions.floats(from: prePostConv)
-        guard !prePostConvFloats.isEmpty, prePostConvFloats.count % 128 == 0 else {
-            throw KokoroANEError.unexpectedStageOutput(
-                stage: "vocoder",
-                feature: "x_pre",
-                descriptor: MLMultiArrayConversions.describe(prePostConv)
-            )
-        }
+        // 7. Tail (fp32): conv_post + exp/sin + iSTFT → PCM. The frame count is derived from the element
+        // count rather than a positional shape read (different backends report different ranks).
         let frameCount = prePostConvFloats.count / 128
         return try tailAudio(prePostConvFloats: prePostConvFloats, frameCount: frameCount)
     }
@@ -222,6 +220,36 @@ public final class KokoroEngine {
             throw KokoroANEError.missingOutput(stage: stage, feature: feature)
         }
         return value
+    }
+
+    /// Reassembles the flat channel-major `x_pre` (`[1, 128, 120·T_a + 1]`) the tail expects from the
+    /// vocoder's two folded outputs: `head` is the lone cat-prepended column (`[1, 128, 1]`) and `body`
+    /// holds the remaining `120·T_a` columns folded to `[1, 128, T_a, 120]`. Both come back in logical
+    /// channel-major order, so flattening `body` per channel restores the original column order exactly;
+    /// the head column is prepended. Sizing is derived from element counts (robust to backends that report
+    /// extra leading singleton dimensions), matching how the rest of the pipeline reads stage tensors.
+    private func unfoldXPre(head: MLMultiArray, body: MLMultiArray) throws -> [Float] {
+        let channels = 128
+        let headFloats = MLMultiArrayConversions.floats(from: head)
+        let bodyFloats = MLMultiArrayConversions.floats(from: body)
+        guard headFloats.count == channels, !bodyFloats.isEmpty, bodyFloats.count % channels == 0 else {
+            throw KokoroANEError.unexpectedStageOutput(
+                stage: "vocoder",
+                feature: "x_pre_body",
+                descriptor: "head=\(MLMultiArrayConversions.describe(head)) body=\(MLMultiArrayConversions.describe(body))"
+            )
+        }
+
+        let bodyColumns = bodyFloats.count / channels
+        let columns = bodyColumns + 1
+        var xPre = [Float](repeating: 0, count: channels * columns)
+        for channel in 0 ..< channels {
+            xPre[channel * columns] = headFloats[channel]
+            let source = channel * bodyColumns
+            let destination = channel * columns + 1
+            xPre.replaceSubrange(destination ..< destination + bodyColumns, with: bodyFloats[source ..< source + bodyColumns])
+        }
+        return xPre
     }
 
     /// Runs the tail over `x_pre` (packed `[1, 128, frameCount]`), windowing the position axis so no
