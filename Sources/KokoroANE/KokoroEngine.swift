@@ -39,6 +39,17 @@ public final class KokoroEngine {
     /// ALBERT's phoneme window: 510 phonemes plus BOS/EOS.
     public static let maximumTokenCount = 512
 
+    /// The duration predictor runs at 40 frames per second: each acoustic frame the alignment stage emits
+    /// becomes exactly 600 audio samples at 24 kHz — a 2× decoder upsample, the iSTFTNet's 60× (10×6), and
+    /// the tail's 5× iSTFT hop — i.e. 25 ms per frame. So the predicted frame count divided by this is the
+    /// exact spoken length of the rendered audio.
+    public static let framesPerSecond = 40.0
+
+    /// The exact spoken duration, in seconds, of `frameCount` acoustic frames (see `framesPerSecond`).
+    public static func seconds(forFrameCount frameCount: Int) -> Double {
+        Double(frameCount) / framesPerSecond
+    }
+
     /// The compiled model bundles `modelsDirectory` must contain.
     public static let modelFileNames = [
         "KokoroAlbert.mlmodelc",
@@ -59,50 +70,23 @@ public final class KokoroEngine {
         voice: KokoroVoicePack,
         speed: Float = 1.0
     ) throws -> [Float] {
-        let inputIds = vocabulary.tokens(for: phonemes)
-        let tokenCount = inputIds.count
-        guard tokenCount <= Self.maximumTokenCount else {
-            throw KokoroANEError.utteranceTooLong(tokenCount: tokenCount)
-        }
-        guard tokenCount > 2 else {
+        // Stages 1–2 (ALBERT → post-ALBERT) yield the integer per-token durations and the hidden states the
+        // alignment stage consumes. Utterances of two or fewer tokens synthesize to silence.
+        guard let durationStage = try runDurationStages(phonemes: phonemes, voice: voice, speed: speed) else {
             return []
         }
+        let predictedDurations = durationStage.predictedDurations
+        let tokenCount = predictedDurations.count
 
         // Stock Kokoro selects the style row by the phoneme *character* count, not the token count.
         let styleS = voice.styleS(forPhonemeCount: phonemes.count)
         let styleTimbre = voice.styleTimbre(forPhonemeCount: phonemes.count)
-        let mask = [Int32](repeating: 1, count: tokenCount)
 
-        // 1. ALBERT: token ids → contextual phoneme embeddings.
-        let albertOutputs = try albert.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "input_ids": try MLMultiArrayConversions.int32Array(inputIds, shape: [1, tokenCount]),
-            "attention_mask": try MLMultiArrayConversions.int32Array(mask, shape: [1, tokenCount]),
-        ]))
-        let bertDur = try output(albertOutputs, stage: "albert", feature: "bert_dur")
-
-        // 2. Post-ALBERT: per-token durations plus the duration-encoder hidden states and text encoding.
-        let postAlbertOutputs = try postAlbert.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "bert_dur": bertDur,
-            "input_ids": try MLMultiArrayConversions.int32Array(inputIds, shape: [1, tokenCount]),
-            "style_s": try MLMultiArrayConversions.float16Array(styleS, shape: [1, 128]),
-            "speed": try MLMultiArrayConversions.float16Array([speed], shape: [1]),
-            "attention_mask": try MLMultiArrayConversions.int32Array(mask, shape: [1, tokenCount]),
-        ]))
-        let duration = try output(postAlbertOutputs, stage: "post_albert", feature: "duration")
-        let durationHidden = try output(postAlbertOutputs, stage: "post_albert", feature: "d")
-        let textEncoding = try output(postAlbertOutputs, stage: "post_albert", feature: "t_en")
-
-        // 3. Alignment: integer per-token durations → frame-aligned encodings. The rounding and the ≥1
-        // floor mirror the upstream Python pipeline.
-        let durationFloats = MLMultiArrayConversions.floats(from: duration)
-        var predictedDurations = [Int32](repeating: 0, count: tokenCount)
-        for index in 0 ..< tokenCount {
-            predictedDurations[index] = max(1, Int32(durationFloats[index].rounded()))
-        }
+        // 3. Alignment: integer per-token durations → frame-aligned encodings.
         let alignmentOutputs = try alignment.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "pred_dur": try MLMultiArrayConversions.int32Array(predictedDurations, shape: [1, tokenCount]),
-            "d": durationHidden,
-            "t_en": textEncoding,
+            "d": durationStage.durationHidden,
+            "t_en": durationStage.textEncoding,
         ]))
         let alignedEncoding = try output(alignmentOutputs, stage: "alignment", feature: "en")
         let alignedText = try output(alignmentOutputs, stage: "alignment", feature: "asr")
@@ -152,7 +136,89 @@ public final class KokoroEngine {
         return try tailAudio(prePostConvFloats: prePostConvFloats, frameCount: frameCount)
     }
 
+    /// Predict the acoustic frame count (`T_a`) for one utterance **without synthesizing audio**. Runs only
+    /// the ALBERT and post-ALBERT stages and sums the integer per-token durations the alignment stage would
+    /// consume; the six downstream stages — including the vocoder and tail that dominate synthesis cost — are
+    /// never touched. The result is exact, not an estimate: it is the same `T_a` `synthesize(...)` produces,
+    /// so `KokoroEngine.seconds(forFrameCount:)` equals the rendered audio length modulo the tail's fixed
+    /// `n_fft/2` end-crop (≈0.2 ms per utterance). `speed` scales durations exactly as in `synthesize`, so
+    /// pass the same value. Returns 0 for utterances that synthesize to silence (≤ 2 tokens). Callers chunk
+    /// long text the same way they do for synthesis and sum the per-chunk frame counts.
+    public func predictedFrameCount(
+        phonemes: String,
+        voice: KokoroVoicePack,
+        speed: Float = 1.0
+    ) throws -> Int {
+        guard let durationStage = try runDurationStages(phonemes: phonemes, voice: voice, speed: speed) else {
+            return 0
+        }
+        return durationStage.predictedDurations.reduce(0) { $0 + Int($1) }
+    }
+
     // MARK: Private
+
+    /// The integer per-token durations from the duration predictor, plus the post-ALBERT hidden states the
+    /// alignment stage consumes. `predictedDurations` are rounded and ≥1-floored exactly as upstream, and
+    /// their sum is the utterance's acoustic frame count `T_a`.
+    private struct DurationStageResult {
+        let predictedDurations: [Int32]
+        let durationHidden: MLMultiArray
+        let textEncoding: MLMultiArray
+    }
+
+    /// Run stages 1–2 (ALBERT → post-ALBERT) and derive the integer per-token durations. Returns nil for the
+    /// silence shortcut (≤ 2 tokens, i.e. BOS/EOS only). This is the entire cost of a duration estimate; the
+    /// downstream alignment/prosody/noise/vocoder/tail stages are not run.
+    private func runDurationStages(
+        phonemes: String,
+        voice: KokoroVoicePack,
+        speed: Float
+    ) throws -> DurationStageResult? {
+        let inputIds = vocabulary.tokens(for: phonemes)
+        let tokenCount = inputIds.count
+        guard tokenCount <= Self.maximumTokenCount else {
+            throw KokoroANEError.utteranceTooLong(tokenCount: tokenCount)
+        }
+        guard tokenCount > 2 else {
+            return nil
+        }
+
+        // Stock Kokoro selects the style row by the phoneme *character* count, not the token count.
+        let styleS = voice.styleS(forPhonemeCount: phonemes.count)
+        let mask = [Int32](repeating: 1, count: tokenCount)
+
+        // 1. ALBERT: token ids → contextual phoneme embeddings.
+        let albertOutputs = try albert.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "input_ids": try MLMultiArrayConversions.int32Array(inputIds, shape: [1, tokenCount]),
+            "attention_mask": try MLMultiArrayConversions.int32Array(mask, shape: [1, tokenCount]),
+        ]))
+        let bertDur = try output(albertOutputs, stage: "albert", feature: "bert_dur")
+
+        // 2. Post-ALBERT: per-token durations plus the duration-encoder hidden states and text encoding.
+        let postAlbertOutputs = try postAlbert.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            "bert_dur": bertDur,
+            "input_ids": try MLMultiArrayConversions.int32Array(inputIds, shape: [1, tokenCount]),
+            "style_s": try MLMultiArrayConversions.float16Array(styleS, shape: [1, 128]),
+            "speed": try MLMultiArrayConversions.float16Array([speed], shape: [1]),
+            "attention_mask": try MLMultiArrayConversions.int32Array(mask, shape: [1, tokenCount]),
+        ]))
+        let duration = try output(postAlbertOutputs, stage: "post_albert", feature: "duration")
+        let durationHidden = try output(postAlbertOutputs, stage: "post_albert", feature: "d")
+        let textEncoding = try output(postAlbertOutputs, stage: "post_albert", feature: "t_en")
+
+        // Integer per-token durations: the rounding and the ≥1 floor mirror the upstream Python pipeline,
+        // and they are exactly what the alignment stage consumes — so their sum is the rendered frame count.
+        let durationFloats = MLMultiArrayConversions.floats(from: duration)
+        var predictedDurations = [Int32](repeating: 0, count: tokenCount)
+        for index in 0 ..< tokenCount {
+            predictedDurations[index] = max(1, Int32(durationFloats[index].rounded()))
+        }
+        return DurationStageResult(
+            predictedDurations: predictedDurations,
+            durationHidden: durationHidden,
+            textEncoding: textEncoding
+        )
+    }
 
     /// The tail's iSTFT hop: every `x_pre` position becomes 5 audio samples (deconv kernel 20, stride 5,
     /// `n_fft/2 = 10` cropped from each end), so a `T`-position input yields exactly `5·T − 5` samples.
