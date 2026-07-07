@@ -7,7 +7,7 @@
 // the exact stage and utterance length — no re-run needed to localize it.
 //
 // Usage:
-//   swift run -c release kokoro-soak <models-dir> <voice.bin> [--play] [--units backgroundSafe|upstreamDemo|cpuOnly]
+//   swift run -c release kokoro-soak <models-dir> <voice.bin> [--play] [--units backgroundSafe|foregroundFast|cpuOnly]
 //
 // Exits 0 and prints SOAK PASSED when every case synthesizes (and plays, with --play) cleanly.
 import AVFoundation
@@ -17,7 +17,7 @@ import KokoroANE
 let arguments = CommandLine.arguments
 guard arguments.count >= 3 else {
     FileHandle.standardError.write(Data("""
-    usage: kokoro-soak <models-dir> <voice.bin> [--play] [--units backgroundSafe|upstreamDemo|cpuOnly]
+    usage: kokoro-soak <models-dir> <voice.bin> [--play] [--units backgroundSafe|foregroundFast|cpuOnly]
     """.utf8))
     exit(2)
 }
@@ -32,7 +32,7 @@ let unitsName = arguments.firstIndex(of: "--units").flatMap { index in
 let computeUnits: KokoroStageComputeUnits
 switch unitsName {
 case "backgroundSafe": computeUnits = .backgroundSafe
-case "upstreamDemo": computeUnits = .upstreamDemo
+case "foregroundFast": computeUnits = .foregroundFast
 case "cpuOnly": computeUnits = .cpuOnly
 default:
     FileHandle.standardError.write(Data("unknown units: \(unitsName)\n".utf8))

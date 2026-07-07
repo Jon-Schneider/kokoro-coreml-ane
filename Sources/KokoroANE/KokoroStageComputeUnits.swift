@@ -35,14 +35,22 @@ public struct KokoroStageComputeUnits: Sendable {
     /// running when the host app is backgrounded. The fp32 stages run on the CPU under this policy.
     public static let backgroundSafe = KokoroStageComputeUnits(uniform: .cpuAndNeuralEngine)
 
-    /// The upstream iOS demo's assignment: ANE-friendly stages pinned to CPU+ANE, the fp32 stages
-    /// (prosody/noise/tail) left on `.all` so Core ML may schedule them on the GPU. Fastest in the
-    /// foreground, but not safe while backgrounded on iOS.
-    public static let upstreamDemo = KokoroStageComputeUnits(
+    /// The fastest assignment that is still safe on every Apple GPU: ANE-friendly stages pinned to
+    /// CPU+ANE, the pure-convolution fp32 stages (noise/tail) left on `.all` so Core ML may schedule
+    /// them on the GPU. Not safe while backgrounded on iOS.
+    ///
+    /// This differs from the upstream iOS demo's assignment in one stage: the demo also left prosody on
+    /// `.all`, but the prosody model contains an LSTM (StyleTTS2's shared F0/N recurrence), and MPSGraph's
+    /// GPU LSTM kernel requires runtime JIT compilation of its Metal DAG. On configurations where that JIT
+    /// is unavailable (observed on macOS), the framework aborts the process with
+    /// `GPURNNOps.mm: failed assertion 'JIT not supported'` the first time the prosody stage runs — an
+    /// uncatchable assert, not a recoverable error. Prosody therefore stays on CPU+ANE; noise and tail
+    /// have no recurrent ops and keep their GPU eligibility.
+    public static let foregroundFast = KokoroStageComputeUnits(
         albert: .cpuAndNeuralEngine,
         postAlbert: .cpuAndNeuralEngine,
         alignment: .cpuAndNeuralEngine,
-        prosody: .all,
+        prosody: .cpuAndNeuralEngine,
         noise: .all,
         vocoder: .cpuAndNeuralEngine,
         tail: .all
