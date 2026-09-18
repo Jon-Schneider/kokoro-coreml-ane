@@ -96,6 +96,68 @@ class CoreMLVocoderDualOutput(nn.Module):
         return anchor, x_pre
 
 
+class CoreMLVocoderHead(nn.Module):
+    """fp16 front half of the vocoder: feature convs + encode + decode (widths <= 2*T_a)."""
+    def __init__(self, decoder):
+        super().__init__()
+        self.encode = decoder.encode
+        self.decode = decoder.decode
+        self.F0_conv = decoder.F0_conv
+        self.N_conv = decoder.N_conv
+        self.asr_res = decoder.asr_res
+
+    def forward(self, asr, F0_curve, N, s):
+        F0 = self.F0_conv(F0_curve.unsqueeze(1))
+        N_feat = self.N_conv(N.unsqueeze(1))
+        x = torch.cat([asr, F0, N_feat], dim=1)
+        x = self.encode(x, s)
+        asr_res = self.asr_res(asr)
+        res = True
+        for block in self.decode:
+            if res:
+                x = torch.cat([x, asr_res, F0, N_feat], dim=1)
+            x = block(x, s)
+            if block.upsample_type != 'none':
+                res = False
+        return x
+
+
+class CoreMLGeneratorStage(nn.Module):
+    """fp32 back half of the vocoder: leaky_relu, upsamples, noise adds, resblocks -> x_pre.
+
+    Everything in this segment runs at width >= 20*T_a, beyond the ANE per-dimension
+    limit, so Core ML places it on the CPU under every compute policy. Keeping it fp32
+    avoids the iOS 27 BNNS SME FP16 add tail-load defect (LINKS-1995) — fp32 adds use a
+    different kernel — while preserving a uniform-precision graph (fp16/fp32 per-op
+    islands in this graph mis-execute on macOS CPU)."""
+    def __init__(self, decoder):
+        super().__init__()
+        gen = decoder.generator
+        self.num_kernels = gen.num_kernels
+        self.num_upsamples = gen.num_upsamples
+        self.ups = gen.ups
+        self.resblocks = gen.resblocks
+
+    def forward(self, x, x_source_0, x_source_1, s):
+        noise_sources = [x_source_0, x_source_1]
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x = self.ups[i](x)
+            if i == self.num_upsamples - 1:
+                x = torch.cat([x[:, :, 1:2], x], dim=2)
+            x = x + noise_sources[i]
+            xs = None
+            for j in range(self.num_kernels):
+                if xs is None:
+                    xs = self.resblocks[i * self.num_kernels + j](x, s)
+                else:
+                    xs = xs + self.resblocks[i * self.num_kernels + j](x, s)
+            x = xs / self.num_kernels
+        x_pre = F.leaky_relu(x)
+        anchor = x_pre.mean().unsqueeze(0)
+        return anchor, x_pre
+
+
 class CoreMLTailModel(nn.Module):
     """FP32 tail: conv_post + exp + sin + iSTFT. Runs on ALL (GPU fp32 accum)."""
     def __init__(self, generator):
@@ -528,6 +590,15 @@ def main():
     parser.add_argument('--stages', nargs='+', choices=STAGE_NAMES + ['all'], default=['all'],
                         help=f'Which stages to convert. Choices: all | {" ".join(STAGE_NAMES)}. '
                              f'Skipped stages reuse existing mlpackages on disk for the E2E chain.')
+    parser.add_argument('--fp32-dynamic-adds', action='store_true',
+                        help='Vocoder only: rewrite every FP16 elementwise add with a dynamic last '
+                             'dimension as cast→fp32 add→cast, preserving FP16 boundaries and '
+                             'bit-identical results. Works around the iOS 27 BNNS SME FP16 add '
+                             'tail-load defect (LINKS-1995). Weights and interfaces unchanged.')
+    parser.add_argument('--generator-split', action='store_true',
+                        help='Additionally emit KokoroVocoderHead (fp16, <=2*T_a) and '
+                             'KokoroGenerator (fp32, >=20*T_a) so the always-CPU-bound '
+                             'wide segment never executes FP16 BNNS adds (LINKS-1995).')
     args = parser.parse_args()
     selected = set(STAGE_NAMES) if 'all' in args.stages else set(args.stages)
 
@@ -784,6 +855,54 @@ def main():
         print('    Palettizing...')
         ml = cto.palettize_weights(ml, pal_config)
         ml.save(str(voc_path))
+        if args.generator_split:
+            # Split at the generator boundary: fp16 head (all widths <= 2*T_a,
+            # ANE-eligible) + fp32 generator (widths >= 20*T_a, always CPU-bound).
+            head_path = OUTDIR / 'KokoroVocoderHead.mlpackage'
+            gen_path = OUTDIR / 'KokoroGenerator.mlpackage'
+            print('\n[6a/7] Vocoder head (fp16+int8pal)...')
+            head = CoreMLVocoderHead(model.decoder)
+            head.eval()
+            with torch.no_grad():
+                traced_head = torch.jit.trace(head, (asr, F0_pred, N_pred, style_timbre), strict=False)
+            ml_head = ct.convert(traced_head,
+                inputs=[ct.TensorType(name="asr", shape=(1, 512, T_a_dim), dtype=np.float16),
+                        ct.TensorType(name="F0_curve", shape=(1, T2_dim), dtype=np.float16),
+                        ct.TensorType(name="N_pred", shape=(1, T2_dim), dtype=np.float16),
+                        ct.TensorType(name="style_timbre", shape=(1, 128), dtype=np.float16)],
+                outputs=[ct.TensorType(name="x")],
+                convert_to="mlprogram", minimum_deployment_target=ct.target.iOS17,
+                compute_precision=ct.precision.FLOAT16, compute_units=ct.ComputeUnit.CPU_AND_NE)
+            ml_head = cto.palettize_weights(ml_head, pal_config)
+            ml_head.save(str(head_path))
+
+            print('\n[6b/7] Generator (fp32)...')
+            gen = CoreMLGeneratorStage(model.decoder)
+            gen.eval()
+            with torch.no_grad():
+                gen_x = head(asr, F0_pred, N_pred, style_timbre)
+                traced_gen = torch.jit.trace(
+                    gen, (gen_x, noise_sources[0], noise_sources[1], style_timbre), strict=False)
+            ml_gen = ct.convert(traced_gen,
+                inputs=[ct.TensorType(name="x", shape=(1, gen_x.shape[1], T2_dim), dtype=np.float16),
+                        ct.TensorType(name="x_source_0", shape=(1, ns0_C, T_ns0), dtype=np.float16),
+                        ct.TensorType(name="x_source_1", shape=(1, ns1_C, T_ns1), dtype=np.float16),
+                        ct.TensorType(name="style_timbre", shape=(1, 128), dtype=np.float16)],
+                outputs=[ct.TensorType(name="anchor"), ct.TensorType(name="x_pre")],
+                convert_to="mlprogram", minimum_deployment_target=ct.target.iOS17,
+                compute_precision=ct.precision.FLOAT32, compute_units=ct.ComputeUnit.CPU_AND_NE)
+            ml_gen = cto.palettize_weights(ml_gen, pal_config)
+            ml_gen.save(str(gen_path))
+            bench(head_path, {k: voc_feed[k] for k in ('asr', 'F0_curve', 'N_pred', 'style_timbre')})
+            bench(gen_path, {"x": gen_x.numpy().astype(np.float16),
+                             "x_source_0": voc_feed["x_source_0"],
+                             "x_source_1": voc_feed["x_source_1"],
+                             "style_timbre": voc_feed["style_timbre"]})
+        if args.fp32_dynamic_adds:
+            from fp32_dynamic_adds import apply_fp32_dynamic_adds
+            manifest = apply_fp32_dynamic_adds(voc_path)
+            print(f'    FP32 dynamic adds: {len(manifest["selected"])} rewritten, '
+                  f'{len(manifest["skipped_fp16_adds"])} static FP16 adds kept')
         bench(voc_path, voc_feed)
     else:
         print(f'\n[6/7] Vocoder — SKIP (reusing {voc_path.name})')

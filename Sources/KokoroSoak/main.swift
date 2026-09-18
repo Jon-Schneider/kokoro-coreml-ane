@@ -7,7 +7,7 @@
 // the exact stage and utterance length — no re-run needed to localize it.
 //
 // Usage:
-//   swift run -c release kokoro-soak <models-dir> <voice.bin> [--play] [--units backgroundSafe|foregroundFast|cpuOnly]
+//   swift run -c release kokoro-soak <models-dir> <voice.bin> [--play] [--units backgroundSafe|foregroundFast|cpuOnly] [--layout monolithic|split] [--rounds N]
 //
 // Exits 0 and prints SOAK PASSED when every case synthesizes (and plays, with --play) cleanly.
 import AVFoundation
@@ -38,6 +38,21 @@ default:
     FileHandle.standardError.write(Data("unknown units: \(unitsName)\n".utf8))
     exit(2)
 }
+
+let layoutName = arguments.firstIndex(of: "--layout").flatMap { index in
+    arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
+} ?? "monolithic"
+let layout: KokoroEngine.VocoderLayout
+switch layoutName {
+case "monolithic": layout = .monolithic
+case "split": layout = .split
+default:
+    FileHandle.standardError.write(Data("unknown layout: \(layoutName)\n".utf8))
+    exit(2)
+}
+let rounds = arguments.firstIndex(of: "--rounds").flatMap { index in
+    arguments.indices.contains(index + 1) ? Int(arguments[index + 1]) : nil
+} ?? 1
 
 func log(_ message: String) {
     print("[soak] \(message)")
@@ -98,9 +113,9 @@ final class SoakPlayer {
 }
 
 do {
-    log("loading engine from \(modelsDirectory.path) (units: \(unitsName))")
+    log("loading engine from \(modelsDirectory.path) (units: \(unitsName), layout: \(layoutName))")
     let loadStart = Date()
-    let engine = try KokoroEngine(modelsDirectory: modelsDirectory, computeUnits: computeUnits)
+    let engine = try KokoroEngine(modelsDirectory: modelsDirectory, computeUnits: computeUnits, vocoderLayout: layout)
     let voiceName = voiceURL.deletingPathExtension().lastPathComponent
     let voice = try KokoroVoicePack(name: voiceName, contentsOf: voiceURL)
     log("engine + voice '\(voiceName)' loaded in \(String(format: "%.0f", -loadStart.timeIntervalSinceNow * 1000))ms")
@@ -114,26 +129,28 @@ do {
     // long cases force multiple tail windows — the configuration that crashed on iPhone.
     let phonemeCounts = [12, 47, 95, 190, 300, 380, 469, 509]
     var totalAudioSeconds = 0.0
-    for (index, phonemeCount) in phonemeCounts.enumerated() {
-        let phonemes = utterance(ofPhonemeCount: phonemeCount)
-        log("case \(index + 1)/\(phonemeCounts.count) BEGIN synthesize: \(phonemes.count) phonemes")
-        let start = Date()
-        let samples = try engine.synthesize(phonemes: phonemes, voice: voice)
-        let elapsed = -start.timeIntervalSinceNow
-        let seconds = Double(samples.count) / Double(KokoroEngine.sampleRate)
-        totalAudioSeconds += seconds
-        log(String(format: "case %d OK: %.2fs audio, %d samples, %.0fms (%.1fx real-time)",
-                   index + 1, seconds, samples.count, elapsed * 1000, seconds / elapsed))
+    for round in 1...rounds {
+        for (index, phonemeCount) in phonemeCounts.enumerated() {
+            let phonemes = utterance(ofPhonemeCount: phonemeCount)
+            log("round \(round) case \(index + 1)/\(phonemeCounts.count) BEGIN synthesize: \(phonemes.count) phonemes")
+            let start = Date()
+            let samples = try engine.synthesize(phonemes: phonemes, voice: voice)
+            let elapsed = -start.timeIntervalSinceNow
+            let seconds = Double(samples.count) / Double(KokoroEngine.sampleRate)
+            totalAudioSeconds += seconds
+            log(String(format: "round %d case %d OK: %.2fs audio, %d samples, %.0fms (%.1fx real-time)",
+                       round, index + 1, seconds, samples.count, elapsed * 1000, seconds / elapsed))
 
-        guard samples.allSatisfy({ $0.isFinite }) else {
-            log("case \(index + 1) FAILED: non-finite samples in output")
-            exit(1)
-        }
+            guard samples.allSatisfy({ $0.isFinite }) else {
+                log("round \(round) case \(index + 1) FAILED: non-finite samples in output")
+                exit(1)
+            }
 
-        if let player {
-            log("case \(index + 1) BEGIN playback")
-            try player.schedule(samples)
-            log("case \(index + 1) playback done")
+            if let player {
+                log("round \(round) case \(index + 1) BEGIN playback")
+                try player.schedule(samples)
+                log("round \(round) case \(index + 1) playback done")
+            }
         }
     }
 

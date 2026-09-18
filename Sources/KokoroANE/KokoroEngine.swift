@@ -19,16 +19,38 @@ public final class KokoroEngine {
 
     public init(
         modelsDirectory: URL,
-        computeUnits: KokoroStageComputeUnits = .backgroundSafe
+        computeUnits: KokoroStageComputeUnits = .backgroundSafe,
+        vocoderLayout: VocoderLayout = .monolithic
     ) throws {
         albert = try Self.loadModel("KokoroAlbert", in: modelsDirectory, units: computeUnits.albert)
         postAlbert = try Self.loadModel("KokoroPostAlbert", in: modelsDirectory, units: computeUnits.postAlbert)
         alignment = try Self.loadModel("KokoroAlignment", in: modelsDirectory, units: computeUnits.alignment)
         prosody = try Self.loadModel("KokoroProsody", in: modelsDirectory, units: computeUnits.prosody)
         noise = try Self.loadModel("KokoroNoise", in: modelsDirectory, units: computeUnits.noise)
-        vocoder = try Self.loadModel("KokoroVocoder", in: modelsDirectory, units: computeUnits.vocoder)
+        switch vocoderLayout {
+        case .monolithic:
+            vocoder = try Self.loadModel("KokoroVocoder", in: modelsDirectory, units: computeUnits.vocoder)
+            vocoderHead = nil
+            generator = nil
+        case .split:
+            // Matched pair, loaded atomically: the fp16 head covers the ANE-eligible segment (all widths
+            // <= 2*T_a); the fp32 generator covers the wide tail of the graph whose fp16 adds hit the
+            // iOS 27 BNNS tail-load defect (LINKS-1995). The generator runs CPU-only: fp32 is not
+            // ANE-capable, so CPU_AND_NE would place it on the CPU anyway — the explicit policy is
+            // background-safe either way.
+            vocoder = nil
+            vocoderHead = try Self.loadModel("KokoroVocoderHead", in: modelsDirectory, units: computeUnits.vocoder)
+            generator = try Self.loadModel("KokoroGenerator", in: modelsDirectory, units: .cpuOnly)
+        }
         tail = try Self.loadModel("KokoroTail", in: modelsDirectory, units: computeUnits.tail)
         vocabulary = try KokoroVocabulary()
+    }
+
+    /// Which vocoder model set the engine loads. `.split` requires both `KokoroVocoderHead.mlmodelc`
+    /// and `KokoroGenerator.mlmodelc` from the same conversion; never mix with the monolith.
+    public enum VocoderLayout: Sendable {
+        case monolithic
+        case split
     }
 
     // MARK: Public
@@ -50,16 +72,22 @@ public final class KokoroEngine {
         Double(frameCount) / framesPerSecond
     }
 
-    /// The compiled model bundles `modelsDirectory` must contain.
-    public static let modelFileNames = [
-        "KokoroAlbert.mlmodelc",
-        "KokoroPostAlbert.mlmodelc",
-        "KokoroAlignment.mlmodelc",
-        "KokoroProsody.mlmodelc",
-        "KokoroNoise.mlmodelc",
-        "KokoroVocoder.mlmodelc",
-        "KokoroTail.mlmodelc",
-    ]
+    /// The compiled model bundles `modelsDirectory` must contain for the monolithic layout.
+    public static let modelFileNames = modelFileNames(for: .monolithic)
+
+    /// The compiled model bundles required for a vocoder layout. `.split` replaces the monolithic
+    /// vocoder with the matched head/generator pair (LINKS-1995); the pair is versioned together.
+    public static func modelFileNames(for layout: VocoderLayout) -> [String] {
+        [
+            "KokoroAlbert.mlmodelc",
+            "KokoroPostAlbert.mlmodelc",
+            "KokoroAlignment.mlmodelc",
+            "KokoroProsody.mlmodelc",
+            "KokoroNoise.mlmodelc",
+            layout == .split ? "KokoroVocoderHead.mlmodelc" : "KokoroVocoder.mlmodelc",
+            "KokoroTail.mlmodelc",
+        ] + (layout == .split ? ["KokoroGenerator.mlmodelc"] : [])
+    }
 
     public let vocabulary: KokoroVocabulary
 
@@ -70,6 +98,8 @@ public final class KokoroEngine {
         voice: KokoroVoicePack,
         speed: Float = 1.0
     ) throws -> [Float] {
+        predictionLock.lock()
+        defer { predictionLock.unlock() }
         // Stages 1–2 (ALBERT → post-ALBERT) yield the integer per-token durations and the hidden states the
         // alignment stage consumes. Utterances of two or fewer tokens synthesize to silence.
         guard let durationStage = try runDurationStages(phonemes: phonemes, voice: voice, speed: speed) else {
@@ -108,17 +138,58 @@ public final class KokoroEngine {
         let source0 = try output(noiseOutputs, stage: "noise", feature: "x_source_0")
         let source1 = try output(noiseOutputs, stage: "noise", feature: "x_source_1")
 
-        // 6. Vocoder (fp16, ANE): the bulk of the decoder. The anchor output exists only to keep the
-        // graph ANE-resident; only `x_pre` feeds the tail.
-        let vocoderOutputs = try vocoder.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "asr": alignedText,
-            "F0_curve": f0Curve,
-            "N_pred": noiseCurve,
-            "x_source_0": source0,
-            "x_source_1": source1,
-            "style_timbre": try MLMultiArrayConversions.float16Array(styleTimbre, shape: [1, 128]),
-        ]))
-        let prePostConv = try output(vocoderOutputs, stage: "vocoder", feature: "x_pre")
+        // 6. Vocoder stage(s). The anchor output exists only to keep the graph ANE-resident; only
+        // `x_pre` feeds the tail. Both paths use a caller-owned output backing for `x_pre`: Core ML
+        // otherwise retains one output-sized allocation per prediction (~12.8 MB fp16 / ~25.6 MB fp32
+        // per utterance, unbounded — observed on-device, LINKS-1995 Gate 4a).
+        let prePostConv: MLMultiArray
+        if let vocoderHead, let generator {
+            let headOutputs = try vocoderHead.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+                "asr": alignedText,
+                "F0_curve": f0Curve,
+                "N_pred": noiseCurve,
+                "style_timbre": try MLMultiArrayConversions.float16Array(styleTimbre, shape: [1, 128]),
+            ]))
+            let x = try output(headOutputs, stage: "vocoder_head", feature: "x")
+            guard x.count % 512 == 0 else {
+                throw KokoroANEError.unexpectedStageOutput(
+                    stage: "vocoder_head",
+                    feature: "x",
+                    descriptor: MLMultiArrayConversions.describe(x)
+                )
+            }
+            // Head output is [1, 512, 2*T_a]; the generator emits 120*T_a + 1 positions of x_pre.
+            // The backing region is mutable shared storage: the lock is held from before the write
+            // until the prediction's output has been copied out of the region, so concurrent
+            // syntheses can never observe or overwrite a live generation.
+            let xPreWidth = 60 * (x.count / 512) + 1
+            xPreBackingLock.lock()
+            defer { xPreBackingLock.unlock() }
+            let genOptions = MLPredictionOptions()
+            genOptions.outputBackings = [
+                "x_pre": try sharedXPreBacking(width: xPreWidth, dataType: .float32),
+            ]
+            let generatorOutputs = try generator.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+                "x": x,
+                "x_source_0": source0,
+                "x_source_1": source1,
+                "style_timbre": try MLMultiArrayConversions.float16Array(styleTimbre, shape: [1, 128]),
+            ]), options: genOptions)
+            let generated = try output(generatorOutputs, stage: "generator", feature: "x_pre")
+            // Copy into independent storage while the lease is still held.
+            let generatedFloats = MLMultiArrayConversions.floats(from: generated)
+            prePostConv = try MLMultiArrayConversions.floatArray(generatedFloats, shape: [1, 128, xPreWidth])
+        } else {
+            let vocoderOutputs = try vocoder!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+                "asr": alignedText,
+                "F0_curve": f0Curve,
+                "N_pred": noiseCurve,
+                "x_source_0": source0,
+                "x_source_1": source1,
+                "style_timbre": try MLMultiArrayConversions.float16Array(styleTimbre, shape: [1, 128]),
+            ]))
+            prePostConv = try output(vocoderOutputs, stage: "vocoder", feature: "x_pre")
+        }
 
         // 7. Tail (fp32): conv_post + exp/sin + iSTFT → PCM. The vocoder declares no static shape for
         // `x_pre` and different Core ML backends report different ranks for it (rank 3 on macOS, but
@@ -149,6 +220,8 @@ public final class KokoroEngine {
         voice: KokoroVoicePack,
         speed: Float = 1.0
     ) throws -> Int {
+        predictionLock.lock()
+        defer { predictionLock.unlock() }
         guard let durationStage = try runDurationStages(phonemes: phonemes, voice: voice, speed: speed) else {
             return 0
         }
@@ -254,8 +327,56 @@ public final class KokoroEngine {
     private let alignment: MLModel
     private let prosody: MLModel
     private let noise: MLModel
-    private let vocoder: MLModel
+    private let vocoder: MLModel?
     private let tail: MLModel
+    private let vocoderHead: MLModel?
+    private let generator: MLModel?
+    /// Caller-owned storage for `x_pre` output backings. One region is allocated at the maximum
+    /// declared width and never released/reallocated while the engine lives: Core ML pins supplied
+    /// backing storage process-wide (fresh buffers grow like the unbacked path; storage-keyed reuse
+    /// stays flat), so per-width views are carved out of this single region to keep memory bounded.
+    private var xPreBackingRegion: UnsafeMutableRawPointer?
+    private var xPreBackingElementBytes = 0
+    /// Serializes writes to and reads from `xPreBackingRegion` (see `synthesize`).
+    private let xPreBackingLock = NSLock()
+
+    /// Serializes every prediction on this engine's shared `MLModel`s. Core ML requires synchronous
+    /// predictions to be serialized per model instance; the app shares one engine across narration,
+    /// previews, and duration probes, so the guarantee lives here rather than in callers.
+    private let predictionLock = NSLock()
+
+    deinit {
+        xPreBackingRegion?.deallocate()
+    }
+
+    /// Widest `x_pre` the vocoder/generator can emit: 120*T_a + 1 at the declared T_a bound of 2000.
+    private static let xPreMaximumWidth = 240001
+
+    /// Returns an exact-shape `MLMultiArray` view into the shared backing region.
+    private func sharedXPreBacking(width: Int, dataType: MLMultiArrayDataType) throws -> MLMultiArray {
+        let elementBytes = dataType == .float32 ? 4 : 2
+        if xPreBackingRegion == nil {
+            xPreBackingRegion = UnsafeMutableRawPointer.allocate(
+                byteCount: 128 * Self.xPreMaximumWidth * elementBytes,
+                alignment: 64
+            )
+            xPreBackingElementBytes = elementBytes
+        }
+        guard xPreBackingElementBytes == elementBytes, width <= Self.xPreMaximumWidth else {
+            throw KokoroANEError.unexpectedStageOutput(
+                stage: "vocoder",
+                feature: "x_pre",
+                descriptor: "backing width \(width) or dtype \(dataType) incompatible with allocated region"
+            )
+        }
+        return try MLMultiArray(
+            dataPointer: xPreBackingRegion!,
+            shape: [1, 128, NSNumber(value: width)],
+            dataType: dataType,
+            strides: [NSNumber(value: 128 * width), NSNumber(value: width), 1],
+            deallocator: nil
+        )
+    }
 
     /// Load `<name>.mlmodelc` from the models directory. If only a `.mlpackage` is present (local
     /// development), compile it once and cache the result alongside it.
