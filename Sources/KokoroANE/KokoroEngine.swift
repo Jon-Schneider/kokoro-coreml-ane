@@ -180,6 +180,15 @@ public final class KokoroEngine {
             let generatedFloats = MLMultiArrayConversions.floats(from: generated)
             prePostConv = try MLMultiArrayConversions.floatArray(generatedFloats, shape: [1, 128, xPreWidth])
         } else {
+            // Same retention fix as the split generator: the monolith's fp16 `x_pre` leaks ~12.8 MB
+            // per prediction. `alignedText` is [1, 512, 2*T_a]; x_pre is 120*T_a + 1 positions.
+            let xPreWidth = 60 * (alignedText.count / 512) + 1
+            xPreBackingLock.lock()
+            defer { xPreBackingLock.unlock() }
+            let vocoderOptions = MLPredictionOptions()
+            vocoderOptions.outputBackings = [
+                "x_pre": try sharedXPreBacking(width: xPreWidth, dataType: .float16),
+            ]
             let vocoderOutputs = try vocoder!.prediction(from: MLDictionaryFeatureProvider(dictionary: [
                 "asr": alignedText,
                 "F0_curve": f0Curve,
@@ -187,8 +196,11 @@ public final class KokoroEngine {
                 "x_source_0": source0,
                 "x_source_1": source1,
                 "style_timbre": try MLMultiArrayConversions.float16Array(styleTimbre, shape: [1, 128]),
-            ]))
-            prePostConv = try output(vocoderOutputs, stage: "vocoder", feature: "x_pre")
+            ]), options: vocoderOptions)
+            let generated = try output(vocoderOutputs, stage: "vocoder", feature: "x_pre")
+            // Copy into independent storage while the lease is still held.
+            let generatedFloats = MLMultiArrayConversions.floats(from: generated)
+            prePostConv = try MLMultiArrayConversions.floatArray(generatedFloats, shape: [1, 128, xPreWidth])
         }
 
         // 7. Tail (fp32): conv_post + exp/sin + iSTFT → PCM. The vocoder declares no static shape for
