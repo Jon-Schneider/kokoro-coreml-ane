@@ -1,6 +1,6 @@
 # kokoro-coreml
 
-Convert Kokoro TTS to CoreML — fp16+int8pal preset (80MB), **25× real-time on M4 Mac Mini**, **17× on iPhone 16 Pro**, with the bulk of the workload running on ANE.
+Convert Kokoro TTS to CoreML — mixed-precision, int8-palettized models (80MB) for the seven-stage pipeline. The original release measured **25× real-time on M4 Mac Mini** and **17× on iPhone 16 Pro**; the updated Prosody stage and optional split vocoder need new full-chain benchmarks.
 
 Produces 7 mlpackages: `KokoroAlbert`, `KokoroPostAlbert`, `KokoroAlignment`, `KokoroProsody`, `KokoroNoise`, `KokoroVocoder`, `KokoroTail`.
 
@@ -22,6 +22,8 @@ uv run python convert.py
 ```
 
 Outputs the 7 mlpackages plus `ref.wav` (PyTorch) and `test.wav` (CoreML chain) to `output/`. Flags: `--max-frames N` (default 2000, ≈50s of audio — covers ALBERT's 510-token cap with headroom), `--stages name1 name2 ...` (skipped stages reuse existing mlpackages).
+
+Use `--generator-split` to additionally produce `KokoroVocoderHead` and `KokoroGenerator`. The split head uses full-precision math with fp16 inputs and output; the generator already uses full-precision math.
 
 ## Benchmark
 
@@ -69,12 +71,16 @@ To run the demo, drop the 7 mlpackages from `output/` (after `convert.py`) into 
 | Albert | fp16 + int8pal | CPU_AND_NE | text encoder |
 | PostAlbert | fp16 + int8pal | CPU_AND_NE | duration + d + t_en |
 | Alignment | fp16 + int8pal | CPU_AND_NE | length regulation (cumsum + broadcast) |
-| Prosody | fp16 + int8pal | ALL | F0 + N |
+| Prosody | fp32 math, fp16 I/O + int8pal | ALL | F0 + N |
 | Noise | fp32 + int8pal | ALL | SineGen + STFT + noise convs |
 | Vocoder | fp16 + int8pal | CPU_AND_NE | dual output: anchor + x_pre |
 | Tail | fp32 | ALL | conv_post + exp + sin + iSTFT |
 
 ## Design notes
+
+**Prosody precision.** The fp16 Prosody graph can mispredict the opening unvoiced pitch of a long utterance. On a confirmed 293-phoneme input, most of its first 23 F0 frames are about 119 Hz while PyTorch predicts near zero; a full-precision Prosody graph reduces the first-100-frame mean error to 0.43 Hz even with 8-bit weight palettization. The model keeps fp16 inputs and outputs so the other six stages need no interface changes.
+
+**Split vocoder-head precision.** For the same 293-phoneme input, the fp16 head's first 50 output frames have correlation 0.39 with PyTorch even without weight compression. Converting the head to full-precision math while keeping fp16 inputs and output raises correlation above 0.9999999 without compression and 0.99997 after 8-bit palettization. Listening checks confirmed that the corrected, compressed Prosody and split-head models remove the opening distortion on both Mac and iPhone for the exact Part I and Part II problem chunks. The split vocoder is the path used by Stache; the separate seven-stage monolithic vocoder still uses fp16 math.
 
 This pipeline is the result of a long sequence of dead ends. Key lessons:
 

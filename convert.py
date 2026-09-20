@@ -1,4 +1,4 @@
-"""Convert Kokoro TTS to CoreML — fp16+int8pal preset (7 mlpackages).
+"""Convert Kokoro TTS to CoreML — mixed-precision, int8-palettized models.
 
 Output: KokoroAlbert, KokoroPostAlbert, KokoroAlignment, KokoroProsody,
 KokoroNoise, KokoroVocoder, KokoroTail.
@@ -97,7 +97,7 @@ class CoreMLVocoderDualOutput(nn.Module):
 
 
 class CoreMLVocoderHead(nn.Module):
-    """fp16 front half of the vocoder: feature convs + encode + decode (widths <= 2*T_a)."""
+    """Front half of the vocoder: feature convs + encode + decode (widths <= 2*T_a)."""
     def __init__(self, decoder):
         super().__init__()
         self.encode = decoder.encode
@@ -585,7 +585,7 @@ STAGE_NAMES = ['albert', 'post_albert', 'alignment', 'prosody', 'noise', 'vocode
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert Kokoro TTS to CoreML (fp16+int8pal preset)')
+    parser = argparse.ArgumentParser(description='Convert Kokoro TTS to CoreML (mixed-precision preset)')
     parser.add_argument('--max-frames', type=int, default=2000, help='Max T_a frames for RangeDim (also static buffer cap in Alignment trace)')
     parser.add_argument('--stages', nargs='+', choices=STAGE_NAMES + ['all'], default=['all'],
                         help=f'Which stages to convert. Choices: all | {" ".join(STAGE_NAMES)}. '
@@ -596,7 +596,7 @@ def main():
                              'bit-identical results. Works around the iOS 27 BNNS SME FP16 add '
                              'tail-load defect (LINKS-1995). Weights and interfaces unchanged.')
     parser.add_argument('--generator-split', action='store_true',
-                        help='Additionally emit KokoroVocoderHead (fp16, <=2*T_a) and '
+                        help='Additionally emit KokoroVocoderHead (fp32 math, fp16 I/O, <=2*T_a) and '
                              'KokoroGenerator (fp32, >=20*T_a) so the always-CPU-bound '
                              'wide segment never executes FP16 BNNS adds (LINKS-1995).')
     args = parser.parse_args()
@@ -780,12 +780,12 @@ def main():
     else:
         print(f'\n[3/7] Alignment — SKIP (reusing {align_path.name})')
 
-    # ═══ 4/7: Prosody (fp16+int8pal) ═══
+    # ═══ 4/7: Prosody (fp32 math, fp16 I/O, int8pal) ═══
     pros_path = OUTDIR / 'KokoroProsody.mlpackage'
     pros_feed = {"en": en.numpy().astype(np.float16),
                  "style_s": s.numpy().astype(np.float16)}
     if 'prosody' in selected:
-        print('\n[4/7] Prosody (fp16+int8pal)...')
+        print('\n[4/7] Prosody (fp32 math, fp16 I/O, int8pal)...')
         prosody = CoreMLProsodyF0N(model.predictor)
         prosody.eval()
         with torch.no_grad():
@@ -793,9 +793,13 @@ def main():
         ml = ct.convert(traced,
             inputs=[ct.TensorType(name="en", shape=(1, 640, T_a_dim), dtype=np.float16),
                     ct.TensorType(name="style_s", shape=(1, 128), dtype=np.float16)],
-            outputs=[ct.TensorType(name="F0"), ct.TensorType(name="N")],
+            outputs=[ct.TensorType(name="F0", dtype=np.float16),
+                     ct.TensorType(name="N", dtype=np.float16)],
             convert_to="mlprogram", minimum_deployment_target=ct.target.iOS17,
-            compute_precision=ct.precision.FLOAT16, compute_units=ct.ComputeUnit.ALL)
+            # LINKS-1993: fp16 execution can turn the opening unvoiced F0 into ~119 Hz on long
+            # utterances. Keep the stage's fp16 interfaces for its neighbors, but compute internally
+            # in fp32; 8-bit weight palettization remains safe and preserves download size.
+            compute_precision=ct.precision.FLOAT32, compute_units=ct.ComputeUnit.ALL)
         ml = cto.palettize_weights(ml, pal_config)
         ml.save(str(pros_path))
         bench(pros_path, pros_feed)
@@ -856,11 +860,11 @@ def main():
         ml = cto.palettize_weights(ml, pal_config)
         ml.save(str(voc_path))
         if args.generator_split:
-            # Split at the generator boundary: fp16 head (all widths <= 2*T_a,
-            # ANE-eligible) + fp32 generator (widths >= 20*T_a, always CPU-bound).
+            # Split at the generator boundary: fp32 head with fp16 interfaces
+            # (all widths <= 2*T_a) + fp32 generator (widths >= 20*T_a).
             head_path = OUTDIR / 'KokoroVocoderHead.mlpackage'
             gen_path = OUTDIR / 'KokoroGenerator.mlpackage'
-            print('\n[6a/7] Vocoder head (fp16+int8pal)...')
+            print('\n[6a/7] Vocoder head (fp32 math, fp16 I/O, int8pal)...')
             head = CoreMLVocoderHead(model.decoder)
             head.eval()
             with torch.no_grad():
@@ -870,9 +874,11 @@ def main():
                         ct.TensorType(name="F0_curve", shape=(1, T2_dim), dtype=np.float16),
                         ct.TensorType(name="N_pred", shape=(1, T2_dim), dtype=np.float16),
                         ct.TensorType(name="style_timbre", shape=(1, 128), dtype=np.float16)],
-                outputs=[ct.TensorType(name="x")],
+                outputs=[ct.TensorType(name="x", dtype=np.float16)],
                 convert_to="mlprogram", minimum_deployment_target=ct.target.iOS17,
-                compute_precision=ct.precision.FLOAT16, compute_units=ct.ComputeUnit.CPU_AND_NE)
+                # LINKS-1993: fp16 head execution distorts the first word of some long chunks.
+                # Keep fp16 I/O for the adjacent stages, with fp32 math inside this model.
+                compute_precision=ct.precision.FLOAT32, compute_units=ct.ComputeUnit.CPU_AND_NE)
             ml_head = cto.palettize_weights(ml_head, pal_config)
             ml_head.save(str(head_path))
 
